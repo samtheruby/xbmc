@@ -71,7 +71,7 @@ public:
   CDVDVideoCodec::VCReturn GetPicture(VideoPicture& videoPicture);
 
   void          SetSpeed(int speed);
-  void          SetDrain(bool drain){m_drain = drain;};
+  void          SetDrain(bool drain){m_drain = drain; if (drain) m_tp_drain_start = std::chrono::system_clock::now();};
   void          SetStreamEOF(bool eof){m_stream_eof = eof;};
   void          SetVideoRect(const CRect &SrcRect, const CRect &DestRect);
   void          SetVideoRate(int videoRate);
@@ -145,6 +145,7 @@ private:
   float m_decoder_minimum_stream_buffer;
 
   std::chrono::time_point<std::chrono::system_clock> m_tp_last_frame;
+  std::chrono::time_point<std::chrono::system_clock> m_tp_drain_start;
 
   bool            m_buffer_level_ready;
   float           m_minimum_buffer_level;
