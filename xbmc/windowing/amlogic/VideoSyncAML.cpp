@@ -103,9 +103,17 @@ void CVideoSyncAML::Run(CEvent& stopEvent)
       numVBlanks = 0;
       m_lastKernelTs = 0;
       if (last_fps > 0.0)
+      {
         CLog::Log(LOGDEBUG,
                   "CVideoSyncAML: fps changed {:.3f} → {:.3f}, reset clock",
                   last_fps, cur_fps);
+        // Also refresh VideoReferenceClock::m_RefreshRate so UpdateInterval()
+        // advances m_CurrTime by the correct ns-per-vblank for the new rate.
+        // Without this, m_RefreshRate stays at whatever the rate was at
+        // Setup time and m_CurrTime drifts; audio resampler corrects via
+        // SetSpeed but the transition can produce visible micro-stutter.
+        m_refClock->UpdateRefreshrate();
+      }
       last_fps = cur_fps;
     }
 
@@ -138,11 +146,22 @@ void CVideoSyncAML::Run(CEvent& stopEvent)
           m_refClock->UpdateClock(countVSyncs, CurrentHostCounter());
           continue;
         }
-        // kernelTs == 0 when VD1 is powered down: drop to legacy path
+        // kernelTs == 0 when VD1 is powered down (HDMI mode-switch settle,
+        // VPP reconfig on seek, etc.); unchanged ts means the wake fired
+        // without a real vblank. Either way drop to legacy. Reset
+        // m_lastKernelTs so the first valid ts after the gap is treated as
+        // a fresh anchor — otherwise the catch-up math above reads deltaNs
+        // across the entire blackout and advances m_CurrTime by N×interval
+        // in one shot, on top of what the legacy fallback already advanced
+        // during the gap. That jump is what AE samples right when playback
+        // engages after a refresh-rate-change delay, and is the dominant
+        // cause of audible TrueHD/MAT stutter + paired video stall at
+        // start of playback and post-seek.
         if (kernelTs == 0)
           CLog::Log(LOGDEBUG, "CVideoSyncAML: ioctl returned ts=0 (VD1 off?), legacy fallback");
         else
           CLog::Log(LOGDEBUG, "CVideoSyncAML: ioctl ts unchanged ({}), legacy fallback", kernelTs);
+        m_lastKernelTs = 0;
       }
       else
       {

@@ -78,16 +78,6 @@ bool CWinSystemAmlogic::InitWindowSystem()
      CSysfsPath("/sys/module/di/parameters/nr2_en", 0);
   }
 
-  if (((LINUX_VERSION_CODE >> 16) & 0xFF) < 5)
-  {
-    auto setting = settings->GetSetting(CSettings::SETTING_COREELEC_AMLOGIC_DISABLEGUISCALING);
-    if (setting)
-    {
-      setting->SetVisible(false);
-      settings->SetBool(CSettings::SETTING_COREELEC_AMLOGIC_DISABLEGUISCALING, false);
-    }
-  }
-
   m_nativeDisplay = EGL_DEFAULT_DISPLAY;
 
   CDVDVideoCodecAmlogic::Register();
@@ -136,8 +126,12 @@ bool CWinSystemAmlogic::CreateNewWindow(const std::string& name,
   m_nativeWindow->width = res.iWidth;
   m_nativeWindow->height = res.iHeight;
 
+  // Only honour the user's "delay after refresh change" when the HDMI mode
+  // is actually going to change. Otherwise this stalls things like DV-pipeline
+  // transitions on live-TV channel zaps (1080i50/25 source, GUI already at
+  // 1080p50) where no real mode switch happens and the TV needs no resync.
   int delay = CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt("videoscreen.delayrefreshchange");
-  if (delay > 0)
+  if (delay > 0 && aml_display_mode_changing(res))
   {
     m_delayDispReset = true;
     m_dispResetTimer.Set(std::chrono::milliseconds(static_cast<unsigned int>(delay * 100)));

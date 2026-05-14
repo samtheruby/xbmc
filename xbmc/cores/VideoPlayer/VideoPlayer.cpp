@@ -732,6 +732,8 @@ bool CVideoPlayer::OpenFile(const CFileItem& file, const CPlayerOptions &options
   m_bAbortRequest = false;
   m_error = false;
   m_bCloseRequest = false;
+  m_brokenFileNotified = false;
+  m_brokenFileStallStart = {};
   m_renderManager.PreInit();
 
   Create();
@@ -2083,6 +2085,51 @@ void CVideoPlayer::HandlePlaySpeed()
     }
   }
 
+  // Broken-file gate: both A/V streams stalled for 5+ seconds while we
+  // expect normal forward playback. Corrupt mkv index / mid-stream cluster
+  // breakage manifests here -- the demuxer can't produce packets but isn't
+  // returning EOF either. On some Amlogic setups this leads the kernel codec
+  // into a stall or crash; we abort early instead.
+  //
+  // (Seek-wedge variant -- av_seek_frame stuck on the same kind of corrupt
+  //  source -- is handled separately inside CDVDDemuxFFmpeg::SeekTime, since
+  //  this thread is itself blocked during that case.)
+  const bool brokenFileSetting =
+      m_pDemuxer && m_pInputStream && !m_pInputStream->IsRealtime() &&
+      m_playSpeed == DVD_PLAYSPEED_NORMAL && !tolerateStall &&
+      m_CurrentAudio.inited && m_CurrentVideo.inited &&
+      m_VideoPlayerAudio->IsStalled() && m_VideoPlayerVideo->IsStalled() &&
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+          CSettings::SETTING_COREELEC_VIDEOPLAYER_DETECT_BROKEN_FILES);
+  if (brokenFileSetting)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (m_brokenFileStallStart == std::chrono::steady_clock::time_point{})
+    {
+      m_brokenFileStallStart = now;
+    }
+    else if (now - m_brokenFileStallStart >= std::chrono::seconds(5))
+    {
+      if (!m_brokenFileNotified)
+      {
+        m_brokenFileNotified = true;
+        CLog::Log(LOGERROR,
+                  "CVideoPlayer::HandlePlaySpeed - broken file: audio and "
+                  "video both stalled for 5+ seconds during normal playback "
+                  "- stopping playback");
+        CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Warning,
+                                              g_localizeStrings.Get(55009),
+                                              g_localizeStrings.Get(55010),
+                                              TOAST_DISPLAY_TIME * 2);
+      }
+      m_pDemuxer->MarkBroken();
+    }
+  }
+  else
+  {
+    m_brokenFileStallStart = {};
+  }
+
   // sync streams to clock
   if ((m_CurrentVideo.syncState == IDVDStreamPlayer::SYNC_WAITSYNC) ||
       (m_CurrentAudio.syncState == IDVDStreamPlayer::SYNC_WAITSYNC))
@@ -2167,12 +2214,17 @@ void CVideoPlayer::HandlePlaySpeed()
           }
           else if (videoClock < clock)
           {
-            // Video starts before audio. This typically happens after a chapter skip
-            // where the video decoder outputs key-frame references (earlier PTS) while
-            // audio starts at the chapter position. For passthrough audio, pulling the
-            // clock back creates a large timing gap that ActiveAE can only correct very
-            // slowly (~20ms per TrueHD MAT frame), causing audible dropouts lasting
-            // several seconds. Cap the pullback to 2 seconds to avoid this.
+            // Video starts before audio. After a seek the demuxer hands the
+            // decoder a key-frame at or before the seek target while audio
+            // starts at the target itself, so videoClock can sit up to a full
+            // GOP behind. Pulling the master clock back to videoClock either
+            // makes ActiveAE crawl forward one passthrough frame at a time
+            // (TrueHD/AC3 — audible multi-second dropouts) or leaves decoded
+            // audio queued waiting for the clock to advance to its PTS
+            // (multi-second silence). Cap at 2s so the clock stays anchored
+            // on the audio seek target; the late-frame drop in
+            // VideoPlayerVideo::OutputPicture then prevents the renderer
+            // from presenting the pre-target reference frames.
             if ((clock - videoClock) > DVD_SEC_TO_TIME(2))
             {
               CLog::Log(LOGDEBUG, "VideoPlayer::Sync - video start {:.3f}s behind audio, "
@@ -3724,10 +3776,22 @@ void CVideoPlayer::SeekTime(int64_t iTime)
 {
   int64_t seekOffset = iTime - GetTime();
 
+  // Fast (keyframe-accurate) seek toggle. When on, accurate=false tells the
+  // pipeline not to drop pre-target packets in CheckPlayerInit — audio
+  // anchors at the demuxer's keyframe landing time instead of the seek
+  // target, matching video. Result: clean snap to keyframe with both
+  // streams in sync, at the cost of landing up to one GOP-length earlier
+  // than requested. Off restores frame-accurate seek and its fast-forward
+  // catch-up window on hardware decoders that can't fast-decode pre-target
+  // frames (AML hwdec).
+  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+  const bool fastSeek =
+      settings && settings->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_FAST_SEEK);
+
   CDVDMsgPlayerSeek::CMode mode;
   mode.time = static_cast<double>(iTime);
   mode.backward = true;
-  mode.accurate = true;
+  mode.accurate = !fastSeek;
   mode.trickplay = false;
   mode.sync = true;
 
@@ -4059,6 +4123,21 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
     {
       const CStereoscopicsManager &stereoscopicsManager = gui->GetStereoscopicsManager();
       hint.stereo_mode = stereoscopicsManager.DetectStereoModeByString(m_item.GetPath());
+
+      // Filename-detected stereo files bypass DVDDemuxFFmpeg::SelectAspect,
+      // so hint.aspect stays as the full-frame DAR.  For full-SBS/TAB this
+      // is double the per-eye DAR; the renderer needs per-eye to fit one
+      // view into the halved viewport.  Width/height-based heuristic is
+      // safe here because no MKV stereo_mode tag is present (we only enter
+      // this branch when hint.stereo_mode was empty), so there's no SAR
+      // scaling from the container's DisplayWidth tag to interfere.
+      if (!hint.stereo_mode.empty() && hint.width > 0 && hint.height > 0 && hint.aspect > 0.0)
+      {
+        if (hint.stereo_mode == "left_right" || hint.stereo_mode == "right_left")
+          hint.aspect /= (hint.width / 1920.0);
+        else if (hint.stereo_mode == "top_bottom" || hint.stereo_mode == "bottom_top")
+          hint.aspect *= (hint.height / 1080.0);
+      }
     }
   }
 
@@ -4080,12 +4159,16 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
       // a per-field time_base (DVDDemuxFFmpeg.cpp), so multiplying again by
       // (interlaced ? 2 : 1) here produces 100fps for 1080i25 (any codec —
       // MPEG-2 DVB, HEVC, H.264 MBAFF/PAFF). Re-derive without the interlace
-      // factor when the result exceeds plausible interlaced refresh rates.
+      // factor when the result exceeds plausible interlaced refresh rates,
+      // and halve once more in the rare case fpsrate was over-doubled at the
+      // demuxer (avg_frame_rate already at field rate + non-per-field tbn).
       if (hint.interlaced && framerate > 61.0)
       {
         framerate = DVD_TIME_BASE / CDVDCodecUtils::NormalizeFrameduration(
                                                      (double)DVD_TIME_BASE * hint.fpsscale /
                                                      hint.fpsrate);
+        if (framerate > 61.0)
+          framerate /= 2.0;
         m_processInfo->SetVideoInterlaced(true);
       }
 

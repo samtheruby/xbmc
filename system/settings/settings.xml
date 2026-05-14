@@ -3358,11 +3358,11 @@
         </setting>
         <setting id="audiooutput.volumesteps" type="integer" label="1302" help="36442">
           <level>1</level>
-          <default>90</default>
+          <default>100</default>
           <constraints>
             <minimum>10</minimum>
             <step>5</step>
-            <maximum>90</maximum>
+            <maximum>100</maximum>
           </constraints>
           <control type="list" format="integer" />
         </setting>
@@ -4017,6 +4017,11 @@
           <default>true</default>
           <control type="toggle" />
         </setting>
+        <setting id="coreelec.videoplayer.detectbrokenfiles" type="boolean" label="55007" help="55008">
+          <level>2</level>
+          <default>true</default>
+          <control type="toggle" />
+        </setting>
       </group>
       <group id="2" label="60001">
         <setting id="coreelec.amlogic.dolbyvision.tv.preset" type="notifyint" label="60616" help="60617">
@@ -4594,6 +4599,12 @@
           <control type="toggle" />
         </setting>
         <setting id="coreelec.amlogic.usedisplayasclock" type="boolean" label="14298" help="14299">
+          <requirement>HAVE_AMCODEC</requirement>
+          <level>2</level>
+          <default>true</default>
+          <control type="toggle" />
+        </setting>
+        <setting id="coreelec.amlogic.fastseek" type="boolean" label="14305" help="14306">
           <requirement>HAVE_AMCODEC</requirement>
           <level>2</level>
           <default>true</default>
