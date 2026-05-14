@@ -25,7 +25,7 @@ extern "C"
 class CDemuxStream;
 struct DemuxCryptoSession;
 
-enum class DOVIELType : int
+enum DOVIELType : int
 {
   TYPE_NONE = 0,
   TYPE_FEL,

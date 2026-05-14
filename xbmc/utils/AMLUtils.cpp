@@ -26,7 +26,7 @@
 #include "application/ApplicationPlayer.h"
 #include "cores/DataCacheCore.h"
 #include "utils/log.h"
-#include "jobs/JobManager.h"
+#include "utils/JobManager.h"
 #include "utils/StringUtils.h"
 #include "windowing/GraphicContext.h"
 #include "utils/RegExp.h"
@@ -884,7 +884,7 @@ void aml_dv_send_el_type()
 {
   DOVIStreamInfo dovi_stream_info;
   dovi_stream_info = CServiceBroker::GetDataCacheCore().GetVideoDoViStreamInfo();
-  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_el_type", static_cast<int>(dovi_stream_info.dovi_el_type));
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_el_type", dovi_stream_info.dovi_el_type);
 }
 
 void aml_dv_send_profile(int dvprofile)
