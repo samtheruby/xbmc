@@ -97,7 +97,7 @@ private:
   float         GetBufferLevel(int new_chunk, int &data_len, int &free_len);
   int           DequeueBuffer();
   unsigned int  GetDecoderVideoRate();
-  std::string   GetHDRStaticMetadata();
+  std::string   GetHDRStaticMetadata(bool dv_enable);
 
   std::string   intToFourCCString(unsigned int value);
   std::string   GetDoViCodecFourCC(unsigned int codec_tag);
