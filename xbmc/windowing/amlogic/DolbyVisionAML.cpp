@@ -20,7 +20,6 @@
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
 #include "settings/lib/SettingsManager.h"
-#include "settings/SettingsContainer.h"
 #include "settings/lib/Setting.h"
 #include "guilib/LocalizeStrings.h"
 #include "utils/AMLUtils.h"
@@ -775,7 +774,7 @@ bool CDolbyVisionAML::Setup()
   settingsManager->RegisterSettingOptionsFiller("DolbyVisionVSVDBColourSpace", vsvdb_colour_space_filler);
 
   // Register for ui dv mode change - to change on the fly.
-  SettingsContainer settingSet;
+  std::set<std::string> settingSet;
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_TV_PRESET);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_MODE);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_MODE_ON_LUMINANCE);

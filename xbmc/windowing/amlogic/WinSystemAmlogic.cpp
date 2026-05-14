@@ -78,6 +78,16 @@ bool CWinSystemAmlogic::InitWindowSystem()
      CSysfsPath("/sys/module/di/parameters/nr2_en", 0);
   }
 
+  if (((LINUX_VERSION_CODE >> 16) & 0xFF) < 5)
+  {
+    auto setting = settings->GetSetting(CSettings::SETTING_COREELEC_AMLOGIC_DISABLEGUISCALING);
+    if (setting)
+    {
+      setting->SetVisible(false);
+      settings->SetBool(CSettings::SETTING_COREELEC_AMLOGIC_DISABLEGUISCALING, false);
+    }
+  }
+
   m_nativeDisplay = EGL_DEFAULT_DISPLAY;
 
   CDVDVideoCodecAmlogic::Register();
