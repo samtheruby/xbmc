@@ -167,6 +167,13 @@ bool CWinSystemAmlogic::CreateNewWindow(const std::string& name,
   // Make sure DV Display activates if enabled - TODO: Why needed?
   aml_dv_display_trigger();
 
+  // On first successful window creation, sync /flash/resolution.ini with current
+  // settings so the bootloader picks up native_4k_gui (and the rest) on the next
+  // boot without requiring the user to toggle a setting first. Subsequent
+  // setting changes are handled by DisplaySettings::OnSettingChanging.
+  if (!m_bWindowCreated)
+    write_resolution_ini(res);
+
   m_bWindowCreated = true;
   return true;
 }
