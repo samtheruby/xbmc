@@ -610,6 +610,7 @@ static void set_dv_settings_visible(bool show)
   set_visible(CSettings::SETTING_COREELEC_AMLOGIC_DV_HDR10PLUS_PEAK_BRIGHTNESS_SOURCE, show);
   set_visible(CSettings::SETTING_VIDEOPLAYER_CONVERTDOVI, show);
   set_visible(CSettings::SETTING_COREELEC_AMLOGIC_DV_CMV40_APPEND, show);
+  set_visible(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_OVERRIDE, show);
   set_visible(CSettings::SETTING_COREELEC_AMLOGIC_DV_AUDIO_SEAMLESSBRANCH, show);
   set_visible(CSettings::SETTING_COREELEC_AMLOGIC_DV_FORCE_MODES, show);
 }
@@ -796,6 +797,7 @@ bool CDolbyVisionAML::Setup()
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_STD_SOURCE_LEVEL_5_OSDST);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_SIGNAL_SUBS);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA);
+  settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_OVERRIDE);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_THROTTLE);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_FORCE_MODES);
   settingSet.insert(CSettings::SETTING_COREELEC_AMLOGIC_DV_OVERRIDE_EDID);
@@ -962,7 +964,27 @@ void CDolbyVisionAML::OnSettingChanged(const std::shared_ptr<const CSetting>& se
            settingId == CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_SIGNAL_SUBS ||
            settingId == CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA)
   {
+    // Re-push the L5 sysfs flags so per-folder override.ini writes from
+    // service.p3i.sb take effect mid-playback. Without this, an L5 toggle
+    // from Python would only land on the next aml_dv_on().
+    aml_dv_apply_l5_sysfs();
     set_vsvdb_payload_ver(dv_type, max_lum_nits_value, source_max_pq);
+  }
+  else if (settingId == CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_OVERRIDE)
+  {
+    // L5 active-area override engaged mid-playback (typically from
+    // service.p3i.override writing at onAVStarted, ~1.1s after codec Open).
+    // After kernel commit 61aaaed51c52 the override uses its own
+    // xbmc_override_l5_* sysfs namespace, so detect_stop() (which only
+    // zeroes xbmc_detected_l5_*) no longer clobbers our values — order
+    // here is therefore informational, not load-bearing.
+    aml_dv_apply_l5_override_sysfs();
+    aml_dv_apply_l5_sysfs();
+    if (aml_dv_l5_override_active())
+      aml_dv_detect_active_area_stop();
+    // Note: not auto-restarting detect when the override is cleared
+    // mid-playback. Hidden setting, normally only the addon writes it, and
+    // restart on clear is edge-case enough to defer.
   }
   else if (settingId == CSettings::SETTING_COREELEC_AMLOGIC_DV_FORCE_MODES)
   {

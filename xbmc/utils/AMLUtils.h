@@ -122,6 +122,17 @@ void aml_dv_wait_video_off(int timeout);
 int aml_blackout_policy(int new_blackout);
 unsigned int aml_dv_on(unsigned int mode);
 void aml_dv_off(bool skip_hdmi_update = false);
+// Push the L5-related sysfs flags from current Kodi settings. Called from
+// aml_dv_on() at playback start, and from CDolbyVisionAML::OnSettingChanged
+// so per-folder override.ini writes that mutate L5 settings take effect mid-
+// playback instead of waiting for the next aml_dv_on().
+void aml_dv_apply_l5_sysfs();
+// Diagnostic: snapshot full DV/HDMI/fb0 kernel state + Kodi cached state to
+// debug log. Already called at every DV state transition (dv_on, dv_off,
+// dv_open, dv_close, set_vs10_mode, xbmc_osd). Exposed so CVideoSyncAML can
+// also trigger one when it detects a vsync ioctl stall — that captures
+// post-transition drift the existing transition snapshots can't see.
+void aml_dv_dump_state(const char* tag);
 void aml_get_dv_cap();
 struct xbmc_dv_cap
 {
@@ -166,6 +177,20 @@ int aml_dv_detect_active_area_state();
 void aml_dv_detect_set_file(const std::string& path);
 void aml_dv_detect_active_area_start();
 void aml_dv_detect_active_area_stop();
+// True when coreelec.amlogic.dolbyvision.level5.override is set to ANY value
+// (including "0,0,0,0" — a legitimate override meaning "treat the stream as
+// having no bars / full active frame"). Empty / unparseable = inactive.
+// Used to short-circuit the active-area detect path and to gate the kernel-
+// side xbmc_force_l5_override flag.
+bool aml_dv_l5_override_active();
+
+// Push the L5 active-area override to the amdolby_vision kernel module so
+// the TV sees the override values in the outgoing RPU. Writes the four
+// xbmc_detected_l5_* params plus the xbmc_force_l5_override flag (which
+// makes the kernel substitute regardless of source RPU L5 state). Called
+// from aml_dv_on() at playback start and from CDolbyVisionAML::OnSettingChanged
+// when the override key changes mid-playback.
+void aml_dv_apply_l5_override_sysfs();
 enum DV_MODE aml_dv_mode();
 enum DV_TYPE aml_dv_type();
 unsigned int aml_vs10_by_setting(const std::string setting);

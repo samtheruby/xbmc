@@ -78,6 +78,45 @@ static unsigned int s_dvModeCached = DOLBY_VISION_OUTPUT_MODE_BYPASS;
 // Used by CreateNewWindow to avoid restoring IPT during playback-start mode switches.
 static bool s_dvPlaybackActive = false;
 
+// Last canonical /sys/class/display/mode value we wrote.
+//
+// aml_set_display_resolution does a "null then target" sequence (line ~2884
+// writes "null" deliberately to force the kernel display driver to drop the
+// current mode, then immediately writes the new target). Other code paths
+// (aml_dv_off line ~1281, aml_dv_display_trigger ~1385) round-trip the
+// current value through sysfs to nudge the driver — Get-then-Set the same
+// string. If those round-trips happen to read during the brief intermediate
+// "null" window of aml_set_display_resolution, they write "null" BACK,
+// re-asserting the modeless state that aml_set_display_resolution was about
+// to recover from. The display engine then sits modeless: vsync stalls,
+// decoder backpressures, video frozen / audio continuing — the "vlix bug"
+// (BACK→replay on same-resolution DV content). See test1 trace at 21:02:59:
+// mode goes null at .162 (Kodi intermediate), recovers to 2160p24hz at .285,
+// then null again at .536 — this second null is the round-trip site catching
+// the brief window between .162 and .285 in a different thread.
+//
+// To make "stuck at null" structurally impossible: track the last-known-good
+// mode that was actually written, and have a single helper that round-trips
+// through sysfs but recovers via s_lastDisplayMode if the read came back as
+// "null". The intermediate-null write inside aml_set_display_resolution
+// itself is preserved (it's the legitimate kernel-drop step), but the value
+// of s_lastDisplayMode is updated only when we write a real target — so the
+// helper always has a non-null value to fall back to once the system has
+// ever set a real mode.
+static std::mutex s_lastDisplayModeMutex;
+static std::string s_lastDisplayMode;
+// Forward-declared: defined below near aml_dv_display_trigger, called from
+// aml_dv_off (above) too. Round-trips display/mode through sysfs but recovers
+// to last-known-good if the read returned "null".
+static void aml_display_mode_round_trip(const char* fn);
+
+// Diagnostic: dump full DV/HDMI kernel state and our cached state to debug log.
+// Forward-declared so it's callable from set_vs10_mode (defined before the
+// helper's body, which sits next to aml_dv_off where all statics are in scope).
+// Externally visible (declared in AMLUtils.h) so CVideoSyncAML can trigger a
+// snapshot when it detects a stall on FBIO_WAITFORVSYNC_64.
+void aml_dv_dump_state(const char* tag);
+
 static void aml_dv_reset_osd_max()
 {
   int max(settings()->GetInt(CSettings::SETTING_COREELEC_AMLOGIC_DV_MODE_ON_LUMINANCE));
@@ -87,20 +126,31 @@ static void aml_dv_reset_osd_max()
 static void aml_dv_toggle_frame(unsigned int mode)
 {
   CSysfsPath dolby_vision_flags{"/sys/module/amdolby_vision/parameters/dolby_vision_flags"};
-  if (dolby_vision_flags.Exists()) 
+  if (dolby_vision_flags.Exists())
   {
     dolby_vision_flags.Set(dolby_vision_flags.Get<unsigned int>().value() | FLAG_TOGGLE_FRAME);
     CLog::Log(LOGINFO, "AMLUtils::{} - Toggle Frame - start - for mode [{}]", __FUNCTION__, aml_dv_output_mode_to_string(mode));
     std::chrono::time_point<std::chrono::system_clock> now(std::chrono::system_clock::now());
-    while(true) { 
+    while(true) {
       if ((dolby_vision_flags.Get<unsigned int>().value() & FLAG_TOGGLE_FRAME) == 0) {
         CLog::Log(LOGINFO, "AMLUtils::{} - Toggle Frame - done - for mode [{}]", __FUNCTION__, aml_dv_output_mode_to_string(mode));
         break;
       }
       if ((std::chrono::system_clock::now() - now) >= std::chrono::milliseconds(3000)) {
         CLog::Log(LOGINFO, "AMLUtils::{} - Toggle Frame - wait time elapsed - for mode [{}]", __FUNCTION__, aml_dv_output_mode_to_string(mode));
+        // Timed out without the kernel consuming the toggle request. Happens
+        // when the consume path in amdolby_vision.c:7256/7325 can't run (no
+        // frames yet → new_dovi_setting.video_width/height stay 0). Leaving
+        // FLAG_TOGGLE_FRAME asserted lets the stuck request bleed into
+        // subsequent code paths, where the kernel keeps treating it as
+        // pending — manifests as FBIO_WAITFORVSYNC_64 returning stale
+        // timestamps and the testers' "audio works, picture frozen / HDMI
+        // requires power-cycle" symptom. Force-clear here so the
+        // user-space request doesn't dangle.
+        dolby_vision_flags.Set(dolby_vision_flags.Get<unsigned int>().value() & ~FLAG_TOGGLE_FRAME);
+        CLog::Log(LOGWARNING, "AMLUtils::{} - Toggle Frame - force-cleared stuck FLAG_TOGGLE_FRAME after timeout", __FUNCTION__);
         break;
-      } 
+      }
       usleep(10000); // wait 10ms
     }
   }
@@ -139,6 +189,7 @@ void aml_reset_audio_from_vs10_change()
 
 void aml_dv_set_vs10_mode(unsigned int mode, StreamHdrType hdrType)
 {
+  aml_dv_dump_state("vs10_change/pre");
   enum DV_TYPE dv_type(static_cast<DV_TYPE>(settings()->GetInt(CSettings::SETTING_COREELEC_AMLOGIC_DV_TYPE)));
   if (dv_type == DV_TYPE_VS10_ONLY) return;
 
@@ -166,6 +217,7 @@ void aml_dv_set_vs10_mode(unsigned int mode, StreamHdrType hdrType)
     aml_dv_off();
 
   aml_reset_audio_from_vs10_change();
+  aml_dv_dump_state("vs10_change/post");
 }
 
 void aml_dv_wait_video_off(int timeout)
@@ -596,7 +648,7 @@ void set_vsvdb_payload_ver(enum DV_TYPE dv_type, int max_lum_nits_value, int sou
 // Static flag for kernel-side 422 forcing during DV/HDR10+ playback
 static bool aml_linux_force_422 = false;
 
-unsigned int aml_dv_on(unsigned int mode)
+void aml_dv_apply_l5_sysfs()
 {
   bool dv_level5_enabled(settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5));
   bool dv_source_level_5(dv_level5_enabled && settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_STD_SOURCE_LEVEL_5));
@@ -608,10 +660,23 @@ unsigned int aml_dv_on(unsigned int mode)
   int dv_l5_subs_signal_mode = dv_source_level_5 ? settings()->GetInt(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_SIGNAL_SUBS) : 0;
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_meta_level_5_subt", dv_l5_subs_signal_mode > 0);
 
-  bool dv_detect_active_area(dv_level5_enabled && settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA));
+  /* xbmc_detect_active_area is the kernel-side master enable for the L5
+   * substitution path. The user's auto-detect setting is one source of
+   * substitution values; service.p3i.override is another. Either one
+   * needs the master enable on. */
+  bool dv_detect_active_area = dv_level5_enabled &&
+                               (settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA) ||
+                                aml_dv_l5_override_active());
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_detect_active_area", dv_detect_active_area);
-  CLog::Log(LOGDEBUG, "AMLUtils::aml_dv_on - L5 detect: l5_enabled={} detect_setting={} → detect={}",
-            dv_level5_enabled, dv_detect_active_area, dv_detect_active_area);
+  CLog::Log(LOGDEBUG, "AMLUtils::aml_dv_apply_l5_sysfs - l5_enabled={} src_l5={} osdst={} subt_mode={} detect={}",
+            dv_level5_enabled, dv_source_level_5, dv_source_level_5_osdst,
+            dv_l5_subs_signal_mode, dv_detect_active_area);
+}
+
+unsigned int aml_dv_on(unsigned int mode)
+{
+  aml_dv_apply_l5_sysfs();
+  aml_dv_apply_l5_override_sysfs();
 
   unsigned int xbmc_dv_vsvdb_source_lum_limit_num = 0;
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_source_lum_limit_num", xbmc_dv_vsvdb_source_lum_limit_num);
@@ -891,6 +956,7 @@ unsigned int aml_dv_on(unsigned int mode)
     }
   }
 
+  aml_dv_dump_state("dv_on/post");
   return mode;
 }
 
@@ -1014,6 +1080,87 @@ void aml_dv_reset_l5_signals()
   s_lastOsd = -1;
 }
 
+// Snapshot DV/HDMI kernel state + our cached state to one debug line.
+// Called at every state-transition site so multi-playback traces can be diffed.
+void aml_dv_dump_state(const char* tag)
+{
+  auto rd = [](const char* path) -> std::string {
+    CSysfsPath p{path};
+    if (!p.Exists()) return "-";
+    auto v = p.Get<std::string>();
+    if (!v.has_value()) return "?";
+    std::string s = std::move(v.value());
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+      s.pop_back();
+    return s;
+  };
+
+  CLog::Log(LOGDEBUG,
+    "AMLUtils::aml_dv_dump_state [{}] "
+    "k: mode={} en={} pol={} fl={} ll={} "
+    "vp={} vp_tm={} type={} prof={} non_ipt={} deep_c={} f422={} "
+    "hdr10_ll={} hdr10_ll_inj_n={} vsvdb_inj={} vsvdb_inj_n={} vsvdb=[{}] "
+    "tvled_bt2020={} tvled_no_col={} "
+    "gmax={} blend={} xosd={} subs={} attr=[{}] hdmi_cfg=[{}] | "
+    "tx: hpd={} rxsense={} rhpd={} used={} disp_mode={} sink_type={} | "
+    "geom: fb_win=[{}] fb_fs=[{}] fb_fs_en={} vid_axis=[{}] vid_dis={} | "
+    "l5: meta5={} l5_osdst={} l5_subt={} detect={} ovr_t={} ovr_b={} ovr_l={} ovr_r={} ovr_force={} | "
+    "c: lastOsd={} lastSubs={} dvMode={} f422={} vs10conv={} dvActive={}",
+    tag,
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_mode"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_enable"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_policy"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_flags"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_ll_policy"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_vp"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_vp_tm"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_type"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_profile"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_non_ipt"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_deep_color"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_aml_linux_force_422"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_hdr10_for_dv_ll"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_hdr10_for_dv_ll_inject_num"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_inject"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_inject_num"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_payload"),
+    rd("/sys/module/hdmitx20/parameters/dovi_tv_led_bt2020"),
+    rd("/sys/module/hdmitx20/parameters/dovi_tv_led_no_colorimetry"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_graphic_max"),
+    rd("/sys/module/amdolby_vision/parameters/dv_graphic_blend_test"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_xbmc_osd"),
+    rd("/sys/module/amdolby_vision/parameters/dolby_vision_subtitles"),
+    rd("/sys/class/amhdmitx/amhdmitx0/attr"),
+    rd("/sys/class/amhdmitx/amhdmitx0/config"),
+    // HDMI TX link-state — useful for diagnosing the "audio works, video frozen"
+    // class. hpd_state / rhpd_state flag sink disconnect; rxsense_state shows
+    // whether the sink's R-term is sensed back (link up); hdmi_used / disp_mode
+    // / sink_type catch cases where the kernel thinks HDMI isn't active anymore.
+    rd("/sys/class/amhdmitx/amhdmitx0/hpd_state"),
+    rd("/sys/class/amhdmitx/amhdmitx0/rxsense_state"),
+    rd("/sys/class/amhdmitx/amhdmitx0/rhpd_state"),
+    rd("/sys/class/amhdmitx/amhdmitx0/hdmi_used"),
+    rd("/sys/class/amhdmitx/amhdmitx0/disp_mode"),
+    rd("/sys/class/amhdmitx/amhdmitx0/sink_type"),
+    rd("/sys/class/graphics/fb0/window_axis"),
+    rd("/sys/class/graphics/fb0/free_scale_axis"),
+    rd("/sys/class/graphics/fb0/free_scale"),
+    rd("/sys/class/video/axis"),
+    rd("/sys/class/video/disable_video"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_meta_level_5"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_meta_level_5_osdst"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_meta_level_5_subt"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_detect_active_area"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_override_l5_top"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_override_l5_bottom"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_override_l5_left"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_override_l5_right"),
+    rd("/sys/module/amdolby_vision/parameters/xbmc_force_l5_override"),
+    s_lastOsd, s_lastSubtitles, s_dvModeCached,
+    aml_linux_force_422 ? 1 : 0, vs10_conversion ? 1 : 0,
+    s_dvPlaybackActive ? 1 : 0);
+}
+
 void aml_dv_off(bool skip_hdmi_update)
 {
   aml_dv_detect_active_area_stop();
@@ -1034,6 +1181,20 @@ void aml_dv_off(bool skip_hdmi_update)
   {
     dolby_vision_flags.Set(dolby_vision_flags.Get<unsigned int>().value() & ~(FLAG_FORCE_RGB_OUTPUT));
     dolby_vision_flags.Set(dolby_vision_flags.Get<unsigned int>().value() & ~(FLAG_FORCE_DOVI_LL));
+    // FLAG_TOGGLE_FRAME (0x80000000) is a pending-toggle request the kernel
+    // sets via dolby_vision_set_toggle_flag(1) and clears once the toggle is
+    // consumed in the per-frame processing loop (amdolby_vision.c:7256/7325).
+    // If new_dovi_setting.video_width/height stay 0 because frames never
+    // started flowing during the prior DV session (typical of stop-then-
+    // re-play with HDR10+→DV / VS10 conversions), the consume path never
+    // fires and the flag survives across dv_off into the next dv_on. That
+    // stuck flag then blocks the next playback's frame-toggle, manifests
+    // as FBIO_WAITFORVSYNC_64 returning stale timestamps, and produces the
+    // "audio works, picture frozen / HDMI requires power-cycle" symptom
+    // reported by multiple testers (see kodi.log signature: fl=2147500037
+    // and fl=2147483653 = 0x80000005). Force-clear here so each playback
+    // starts with a clean state machine.
+    dolby_vision_flags.Set(dolby_vision_flags.Get<unsigned int>().value() & ~FLAG_TOGGLE_FRAME);
     dolby_vision_ll_policy.Set(DOLBY_VISION_LL_DISABLE);
   }
 
@@ -1056,6 +1217,17 @@ void aml_dv_off(bool skip_hdmi_update)
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_deep_color", false);
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vp", 0);
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vp_tm", 0);
+  // Clear DV-LL HDR10/VSVDB InfoFrame injection flags. aml_dv_on sets these
+  // for Player-LED HDR/HDR2 output; without unwinding them, the kernel keeps
+  // these module-level enables hot after DV is otherwise off (verified via
+  // dv_dump_state across the Ted→Novocaine live-swap repro). Does not by
+  // itself flush the HDMI TX's own emit-state, but unblocks that as a next
+  // step and removes one source of contradictory signaling.
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_hdr10_for_dv_ll", 'N');
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_hdr10_for_dv_ll_inject_num", 0);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_inject", false);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_inject_num", 0);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_dv_vsvdb_payload", std::string{});
   CSysfsPath("/sys/module/amdolby_vision/parameters/dolby_vision_graphic_max", 0);
   CSysfsPath("/sys/module/amdolby_vision/parameters/dv_graphic_blend_test", 0);
   CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_meta_level_5", false);
@@ -1088,10 +1260,10 @@ void aml_dv_off(bool skip_hdmi_update)
   // trigger in CreateNewWindow handles VPP reset for that path.
   if (modeChange && !skip_hdmi_update)
   {
-    CSysfsPath display_mode{"/sys/class/display/mode"};
-    if (display_mode.Exists())
-      display_mode.Set(display_mode.Get<std::string>().value());
+    aml_display_mode_round_trip(__FUNCTION__);
   }
+
+  aml_dv_dump_state("dv_off/post");
 }
 
 unsigned int aml_dv_dolby_vision_mode()
@@ -1102,6 +1274,7 @@ unsigned int aml_dv_dolby_vision_mode()
 
 void aml_dv_open(StreamHdrType hdrType, unsigned int bitDepth, AVColorPrimaries colorPrimaries)
 {
+  aml_dv_dump_state("dv_open/pre");
   s_dvPlaybackActive = true;
 
   // Detect PM4K once at playback start for OSD visibility override.
@@ -1119,23 +1292,26 @@ void aml_dv_open(StreamHdrType hdrType, unsigned int bitDepth, AVColorPrimaries 
       CLog::Log(LOGINFO, "AMLUtils::{} - SDR BT.2020 detected, bypassing VS10 to preserve gamut", __FUNCTION__);
       if (aml_is_dv_enable())
         aml_dv_off();
+      aml_dv_dump_state("dv_open/post(sdr_bt2020_bypass)");
       return;
     }
 
-    unsigned int vs10_mode = aml_vs10_by_hdrtype(hdrType, bitDepth);    
+    unsigned int vs10_mode = aml_vs10_by_hdrtype(hdrType, bitDepth);
 
-    if (vs10_mode != DOLBY_VISION_OUTPUT_MODE_BYPASS) 
+    if (vs10_mode != DOLBY_VISION_OUTPUT_MODE_BYPASS)
       vs10_mode = aml_dv_on(vs10_mode);
     else if (aml_is_dv_enable()) // DV BYPASS, and it is on - then switch it off.
-      aml_dv_off(); 
+      aml_dv_off();
 
     bool content_is_dv(hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION);
     CLog::Log(LOGINFO, "AMLUtils::{} - DV is [{}], requested with vs10 mode: [{}], set for: [{}]",  __FUNCTION__, aml_is_dv_enable(), aml_dv_output_mode_to_string(vs10_mode), content_is_dv ? "content" : "mapping");
   }
+  aml_dv_dump_state("dv_open/post");
 }
 
 void aml_dv_close()
 {
+  aml_dv_dump_state("dv_close/pre");
   s_dvPlaybackActive = false;
   s_pm4kActive = false;
   s_pm4kHome = nullptr;
@@ -1146,10 +1322,14 @@ void aml_dv_close()
   // IPT is restored for the GUI by the Player.OnStop announcement handler
   // in CDolbyVisionAML when playback truly ends.
   if (aml_dv_mode() == DV_MODE_ON)
+  {
+    aml_dv_dump_state("dv_close/post(dv_mode_on_skip)");
     return;
+  }
 
   if (aml_is_dv_enable())
     aml_dv_off();
+  aml_dv_dump_state("dv_close/post");
 }
 
 bool aml_dv_playback_active()
@@ -1180,11 +1360,47 @@ bool aml_is_dv_enable()
   return (dolby_vision_enable.Exists() && StringUtils::EqualsNoCase(dolby_vision_enable.Get<std::string>().value(), "Y"));
 }
 
+// Round-trip /sys/class/display/mode through sysfs to nudge the kernel
+// display driver (re-applying the current mode re-asserts driver state).
+// CRITICAL: if the read returns "null" — we landed in the brief window
+// between aml_set_display_resolution's intermediate "null" write and its
+// target write — never write "null" BACK. That re-assertion is what
+// locks the display engine modeless and produces the vlix-class freeze.
+// Recover via s_lastDisplayMode (the last canonical target we wrote)
+// instead. If we have nothing to recover to (first call before any
+// target was ever written), skip the write entirely.
+static void aml_display_mode_round_trip(const char* fn)
+{
+  CSysfsPath display_mode{"/sys/class/display/mode"};
+  if (!display_mode.Exists()) return;
+  const std::string cur = display_mode.Get<std::string>().value_or("");
+  if (cur != "null" && !cur.empty())
+  {
+    display_mode.Set(cur);
+    return;
+  }
+  std::lock_guard<std::mutex> lk(s_lastDisplayModeMutex);
+  if (!s_lastDisplayMode.empty() && s_lastDisplayMode != "null")
+  {
+    CLog::Log(LOGWARNING,
+              "AMLUtils::{} - display/mode read as '{}' during round-trip, "
+              "recovering to last-known [{}] instead of re-asserting null",
+              fn, cur.empty() ? "(empty)" : cur, s_lastDisplayMode);
+    display_mode.Set(s_lastDisplayMode);
+  }
+  else
+  {
+    CLog::Log(LOGWARNING,
+              "AMLUtils::{} - display/mode read as '{}' during round-trip, "
+              "no last-known mode to recover to; skipping write",
+              fn, cur.empty() ? "(empty)" : cur);
+  }
+}
+
 void aml_dv_display_trigger()
 {
   if (aml_is_dv_enable()) {
-    CSysfsPath display_mode{"/sys/class/display/mode"};
-    if (display_mode.Exists()) display_mode.Set(display_mode.Get<std::string>().value());
+    aml_display_mode_round_trip(__FUNCTION__);
   }
 }
 
@@ -1267,6 +1483,7 @@ void aml_dv_set_xbmc_osd()
   {
     CSysfsPath("/sys/module/amdolby_vision/parameters/dolby_vision_xbmc_osd", val);
     s_lastOsd = val;
+    aml_dv_dump_state(val ? "xbmc_osd/on" : "xbmc_osd/off");
   }
 }
 
@@ -1291,7 +1508,52 @@ bool aml_dv_detect_active_area_enabled()
 {
   return s_dvModeCached == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
          settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5) &&
-         settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA);
+         settings()->GetBool(CSettings::SETTING_COREELEC_AMLOGIC_DV_DETECT_ACTIVE_AREA) &&
+         !aml_dv_l5_override_active();
+}
+
+/* Parse the override setting into (active, top, bottom, left, right).
+ * "active" means the user has set a value — including "0,0,0,0", which
+ * is a legitimate override meaning "treat the stream as having no bars".
+ * Empty / unparseable = inactive (use whatever the stream's L5 says). */
+static bool _l5_override_parse(uint16_t& top, uint16_t& bottom,
+                               uint16_t& left, uint16_t& right)
+{
+  const std::string s =
+      settings()->GetString(CSettings::SETTING_COREELEC_AMLOGIC_DV_LEVEL5_OVERRIDE);
+  if (s.empty()) return false;
+  unsigned int t = 0, b = 0, l = 0, r = 0;
+  if (std::sscanf(s.c_str(), "%u,%u,%u,%u", &t, &b, &l, &r) != 4) return false;
+  if (t > 0xFFFF || b > 0xFFFF || l > 0xFFFF || r > 0xFFFF) return false;
+  top    = static_cast<uint16_t>(t);
+  bottom = static_cast<uint16_t>(b);
+  left   = static_cast<uint16_t>(l);
+  right  = static_cast<uint16_t>(r);
+  return true;
+}
+
+bool aml_dv_l5_override_active()
+{
+  uint16_t t = 0, b = 0, l = 0, r = 0;
+  return _l5_override_parse(t, b, l, r);
+}
+
+void aml_dv_apply_l5_override_sysfs()
+{
+  uint16_t top = 0, bottom = 0, left = 0, right = 0;
+  const bool active = _l5_override_parse(top, bottom, left, right);
+
+  // xbmc_override_l5_* is the override namespace (kernel commit 61aaaed51c52),
+  // separate from xbmc_detected_l5_* which is owned by the detect thread.
+  // No collision with aml_dv_detect_active_area_stop() zeroing detect paths.
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_override_l5_top",    top);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_override_l5_bottom", bottom);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_override_l5_left",   left);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_override_l5_right",  right);
+  CSysfsPath("/sys/module/amdolby_vision/parameters/xbmc_force_l5_override",  active);
+
+  CLog::Log(LOGDEBUG, "AMLUtils::aml_dv_apply_l5_override_sysfs - active={} t={} b={} l={} r={}",
+            active, top, bottom, left, right);
 }
 
 /* Cached detected values — written by background detection thread,
@@ -2649,6 +2911,16 @@ bool aml_set_display_resolution(const RESOLUTION_INFO &res, std::string framebuf
   {
     if (display_mode.Exists())
       display_mode.Set(mode);
+  }
+
+  // Record last canonical mode actually written so aml_display_mode_round_trip
+  // has a non-null value to recover to if a subsequent read lands on the
+  // intermediate "null" window (line ~2949). Skip recording "null" itself —
+  // that's the wedge state we want to recover FROM, not TO.
+  if (mode != "null" && !mode.empty())
+  {
+    std::lock_guard<std::mutex> lk(s_lastDisplayModeMutex);
+    s_lastDisplayMode = mode;
   }
 
   aml_set_framebuffer_resolution(res, framebuffer_name);
